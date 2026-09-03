@@ -51,3 +51,19 @@ src/notebooklm/_commit.py
 notebooklm.apk/
 frida-scripts/
 error.log
+
+# Private tokens & local storage
+storage/tokens/*
+!storage/tokens/.gitkeep
+storage/db/*
+!storage/db/.gitkeep
+*.lock
+*.browser_profile/
+
+# Generated media files
+*.mp4
+*.mp3
+*.pdf
+media/
+downloads/
+
