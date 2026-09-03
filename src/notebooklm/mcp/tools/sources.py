@@ -33,6 +33,7 @@ from ..._app import source_content as content_core
 from ..._app import source_listing as listing_core
 from ..._app import source_mutations as mut_core
 from ..._app import source_wait as wait_core
+from ..._app.resolve import FULL_ID_PATTERN, validate_id
 from ..._app.serialize import to_jsonable
 from ..._app.source_batch import MAX_BATCH_URLS, batch_item_is_fatal
 from ..._app.views import source_view as _source_view
@@ -48,7 +49,7 @@ from .._confirm import DESTRUCTIVE, READ_ONLY, needs_confirmation
 from .._context import get_client, get_file_transfer
 from .._errors import mcp_errors, tool_error_payload
 from .._paginate import DEFAULT_LIMIT, paginate
-from .._resolve import resolve_notebook, resolve_source, resolve_sources
+from .._resolve import partition_source_refs, resolve_notebook, resolve_source, resolve_sources
 from ._content_sanity import _annotate_thin_warnings
 from ._fileupload import _add_bytes, _add_one, _broker_upload, _decode_upload_b64
 from ._passthrough import passthrough_child_id
@@ -382,30 +383,107 @@ def register(mcp: Any) -> None:
 
     @mcp.tool(annotations=DESTRUCTIVE)
     async def source_delete(
-        ctx: Context, notebook: str, source: str, confirm: bool = False
+        ctx: Context,
+        notebook: str,
+        source: str | None = None,
+        sources: list[str] | str | None = None,
+        confirm: bool = False,
     ) -> dict[str, Any]:
-        """Delete a source (irreversible). Accepts a notebook/source name or ID.
-
-        Two-step confirmation: with ``confirm=False`` (default) it returns a
-        ``needs_confirmation`` preview of the resolved source without deleting;
-        call again with ``confirm=True`` to perform the delete.
+        """Delete sources. ``source`` XOR ``sources``. Preview: omit both.
+        Confirm: pass those previewed ids.
         """
         with mcp_errors():
-            client = await get_client(ctx)
-            nb_id = await resolve_notebook(client, notebook)
-            src_id = await resolve_source(client, nb_id, source)
-            if not confirm:
-                title = title_for_id(await client.sources.list(nb_id), src_id)
-                return needs_confirmation(
-                    {
-                        "action": "delete_source",
-                        "notebook_id": nb_id,
-                        "source_id": src_id,
-                        "title": title,
-                    }
+            # Input guards fire BEFORE any I/O (fail-fast, like source_wait):
+            # the mutual-exclusion error must not be masked by a notebook
+            # NOT_FOUND from ``resolve_notebook`` or by a per-source
+            # NOT_FOUND raised later.
+            coerced = coerce_list(sources)
+            if source is not None and coerced is not None:
+                raise ValidationError(
+                    "pass either 'source' (one) or 'sources' (a subset), not both"
                 )
-            await client.sources.delete(nb_id, src_id)
-            return {"status": "deleted", "notebook_id": nb_id, "source_id": src_id}
+            if coerced is not None and not coerced:
+                raise ValidationError(
+                    "'sources' was empty; omit it to delete a single source, or pass at least one source ref"
+                )
+            # Cap the explicit subset BEFORE resolution so a bad ref can't mask
+            # the cap (shares MAX_WAIT_SOURCE_IDS with source_wait / REST).
+            if coerced is not None and len(coerced) > wait_core.MAX_WAIT_SOURCE_IDS:
+                raise ValidationError(
+                    f"'sources' must contain at most {wait_core.MAX_WAIT_SOURCE_IDS} refs; "
+                    f"got {len(coerced)}. Delete a smaller subset."
+                )
+            if confirm and source is None and coerced is None:
+                raise ValidationError(
+                    "confirm=True requires the previewed source ids as 'sources' "
+                    "(or a single 'source'); omitting both would re-list and can "
+                    "delete sources that were never previewed"
+                )
+            if confirm and coerced is not None:
+                coerced = [validate_id(ref, "source") for ref in coerced]
+                if any(FULL_ID_PATTERN.fullmatch(ref) is None for ref in coerced):
+                    raise ValidationError(
+                        "confirm=True requires canonical source ids returned by the preview; "
+                        "names and prefixes can resolve to different sources"
+                    )
+
+            client = await get_client(ctx)
+
+            # Fast-path: single-id ``source=`` keeps the LEGACY wire shape
+            # (``status`` + ``source_id`` + ``notebook_id``) so existing
+            # callers don't have to learn the bulk aggregate — only
+            # ``sources=`` and the no-arg branch use the new shape.
+            if source is not None and coerced is None:
+                nb_id = await resolve_notebook(client, notebook)
+                src_id = await resolve_source(client, nb_id, source)
+                if not confirm:
+                    title = title_for_id(await client.sources.list(nb_id), src_id)
+                    return needs_confirmation(
+                        {
+                            "action": "delete_source",
+                            "notebook_id": nb_id,
+                            "source_id": src_id,
+                            "title": title,
+                        }
+                    )
+                await client.sources.delete(nb_id, src_id)
+                return {"status": "deleted", "notebook_id": nb_id, "source_id": src_id}
+
+            nb_id = await resolve_notebook(client, notebook)
+            snapshot = await client.sources.list(nb_id)
+
+            if coerced is None:
+                src_ids = [s.id for s in snapshot]
+                not_found: list[dict[str, str]] = []
+            else:
+                src_ids, not_found = partition_source_refs(coerced, snapshot)
+
+            if not confirm:
+                preview_items = [
+                    {"source_id": sid, "title": title_for_id(snapshot, sid)} for sid in src_ids
+                ]
+                preview: dict[str, Any] = {
+                    "action": "delete_sources",
+                    "notebook_id": nb_id,
+                    "count": len(preview_items),
+                    "sources": preview_items,
+                }
+                if not_found:
+                    preview["not_found"] = not_found
+                return needs_confirmation(preview)
+
+            if src_ids:
+                await client.sources.delete_many(nb_id, src_ids)
+            deleted = [{"source_id": sid} for sid in src_ids]
+            return {
+                "status": "deleted",
+                "notebook_id": nb_id,
+                "deleted": deleted,
+                "deleted_count": len(deleted),
+                "not_found": not_found,
+                "not_found_count": len(not_found),
+                "total_count": len(deleted) + len(not_found),
+            }
 
     @mcp.tool(annotations=READ_ONLY)
     async def source_wait(
